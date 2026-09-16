@@ -110,7 +110,7 @@ jobs:
           $uprof = Start-Process -FilePath "$env:UPROF_PATH" -ArgumentList "timechart --event power --interval 100 -d $profilerCap -o `"$env:DATA_DIR\Build_Server\power_data.csv`"" -PassThru -WindowStyle Hidden
           Start-Sleep -Seconds 10
           $startTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
-          docker run --rm -v "${PWD}:/app" -w /app --platform linux/amd64 $env:NODE_IMAGE sh -c "corepack enable && corepack prepare pnpm@11.24.0 --activate && pnpm --filter @immich/plugin-sdk --filter @immich/plugin-core install --frozen-lockfile && pnpm --filter @immich/plugin-sdk --filter @immich/plugin-core build && pnpm --filter immich install --frozen-lockfile && pnpm --filter immich run build" ; $global:LASTEXITCODE = 0
+          docker run --rm -v "${PWD}:/app" -w /app --platform linux/amd64 $env:NODE_IMAGE sh -c "corepack enable && corepack prepare pnpm@11.24.0 --activate && pnpm --filter @immich/sdk --filter @immich/plugin-sdk --filter @immich/plugin-core install --frozen-lockfile && pnpm --filter @immich/sdk build && pnpm --filter @immich/plugin-sdk run build && pnpm --filter @immich/plugin-core run build:tsc && pnpm --filter immich install --frozen-lockfile && pnpm --filter immich run build" ; $global:LASTEXITCODE = 0
           $endTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
           Start-Sleep -Seconds 10
           Stop-Process -Id $uprof.Id -Force -ErrorAction SilentlyContinue
@@ -175,7 +175,7 @@ jobs:
 
           # Pre-install dependencies and build SDK + plugins inside the container
           Write-Host "Pre-installing dependencies and building SDK + plugins..."
-          docker exec $containerId sh -c "pnpm --filter @immich/plugin-sdk --filter @immich/plugin-core install --frozen-lockfile && pnpm --filter @immich/plugin-sdk --filter @immich/plugin-core build && pnpm --filter immich install --frozen-lockfile"
+          docker exec $containerId sh -c "pnpm --filter @immich/sdk --filter @immich/plugin-sdk --filter @immich/plugin-core install --frozen-lockfile && pnpm --filter @immich/sdk build && pnpm --filter @immich/plugin-sdk run build && pnpm --filter @immich/plugin-core run build:tsc && pnpm --filter immich install --frozen-lockfile"
 
           function Invoke-ServerSpan {
             param(
@@ -490,7 +490,7 @@ jobs:
           PROF_PID=$!
           sleep 10
           START_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
-          docker run --rm -v "${PWD}:/app" -w /app --platform linux/arm64 "$NODE_IMAGE" sh -c "corepack enable && corepack prepare pnpm@11.24.0 --activate && pnpm --filter @immich/plugin-sdk --filter @immich/plugin-core install --frozen-lockfile && pnpm --filter @immich/plugin-sdk --filter @immich/plugin-core build && pnpm --filter immich install --frozen-lockfile && pnpm --filter immich run build" || true
+          docker run --rm -v "${PWD}:/app" -w /app --platform linux/arm64 "$NODE_IMAGE" sh -c "corepack enable && corepack prepare pnpm@11.24.0 --activate && pnpm --filter @immich/sdk --filter @immich/plugin-sdk --filter @immich/plugin-core install --frozen-lockfile && pnpm --filter @immich/sdk build && pnpm --filter @immich/plugin-sdk run build && pnpm --filter @immich/plugin-core run build:tsc && pnpm --filter immich install --frozen-lockfile && pnpm --filter immich run build" || true
           END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
           sleep 10
           sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
@@ -554,7 +554,7 @@ jobs:
 
           # Pre-install dependencies and build SDK + plugins inside the container
           echo "Pre-installing dependencies and building SDK + plugins..."
-          docker exec "$CONTAINER_ID" sh -c "pnpm --filter @immich/plugin-sdk --filter @immich/plugin-core install --frozen-lockfile && pnpm --filter @immich/plugin-sdk --filter @immich/plugin-core build && pnpm --filter immich install --frozen-lockfile"
+          docker exec "$CONTAINER_ID" sh -c "pnpm --filter @immich/sdk --filter @immich/plugin-sdk --filter @immich/plugin-core install --frozen-lockfile && pnpm --filter @immich/sdk build && pnpm --filter @immich/plugin-sdk run build && pnpm --filter @immich/plugin-core run build:tsc && pnpm --filter immich install --frozen-lockfile"
 
           run_server_span() {
             local name="$1" calibration="$2" test_path="$3"
