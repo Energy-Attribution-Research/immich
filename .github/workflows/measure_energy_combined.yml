@@ -1,0 +1,793 @@
+name: Immich Energy Profiling (Combined Windows & Mac)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  profile-windows:
+    name: Profile AMD Windows
+    runs-on: [self-hosted, Windows]
+    permissions:
+      contents: write
+
+    env:
+      PROJECT_NAME: "immich"
+      RUN_ID: "win_${{ github.run_id }}"
+      DATA_DIR: "D:\\myPortfolioProject\\immich\\ResearchData\\cpudata\\win_${{ github.run_id }}"
+      UPROF_PATH: "C:\\Program Files\\AMD\\AMDuProf\\bin\\AMDuProfCLI.exe"
+      NODE_IMAGE: "node:22-slim"
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Prepare Directory Structure
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:DATA_DIR\Idle"
+          New-Item -ItemType Directory -Force -Path "$env:DATA_DIR\PNPM_Install"
+          New-Item -ItemType Directory -Force -Path "$env:DATA_DIR\Build_Server"
+          New-Item -ItemType Directory -Force -Path "$env:DATA_DIR\Build_Web"
+          New-Item -ItemType Directory -Force -Path "$env:DATA_DIR\Test_Server_Spans"
+          New-Item -ItemType Directory -Force -Path "$env:DATA_DIR\Test_Web_Spans"
+        shell: powershell
+
+      - name: Capture Hardware Metadata
+        run: |
+          $meta = @{
+            platform     = "amd_windows"
+            captured_at  = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+            cpu_model    = (Get-CimInstance Win32_Processor).Name
+            cpu_cores    = (Get-CimInstance Win32_Processor).NumberOfCores
+            cpu_threads  = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
+            cpu_max_mhz  = (Get-CimInstance Win32_Processor).MaxClockSpeed
+            ram_gb       = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
+            os_version   = (Get-CimInstance Win32_OperatingSystem).Caption
+            docker_ver   = (docker --version)
+          }
+          $meta | ConvertTo-Json | Out-File -FilePath "$env:DATA_DIR\hardware_metadata.json" -Encoding utf8
+        shell: powershell
+
+      - name: Define Windows UTF-8 JSON Writer
+        run: |
+          @'
+          function Write-Utf8JsonNoBom($Path, $Value) {
+            $json = $Value | ConvertTo-Json -Compress
+            $encoding = New-Object System.Text.UTF8Encoding($false)
+            [System.IO.File]::WriteAllText($Path, $json, $encoding)
+          }
+          '@ | Out-File -FilePath "$env:DATA_DIR\write-json.ps1" -Encoding ascii
+        shell: powershell
+
+      - name: Pre-pull Images
+        run: |
+          docker pull --platform linux/amd64 $env:NODE_IMAGE
+        shell: powershell
+
+      # --- SCENARIO 1: IDLE ---
+      - name: Profile Idle Scenario
+        run: |
+          $w3cTraceparent = "00-$((New-Guid).Guid.Replace('-',''))-$(((New-Guid).Guid.Replace('-','')).Substring(0,16))-01"
+          $uprof = Start-Process -FilePath "$env:UPROF_PATH" -ArgumentList "timechart --event power --interval 100 -d 60 -o `"$env:DATA_DIR\Idle\power_data.csv`"" -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 10
+          $startTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+          Start-Sleep -Seconds 30
+          $endTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+          Start-Sleep -Seconds 10
+          Stop-Process -Id $uprof.Id -Force -ErrorAction SilentlyContinue
+          echo "Idle_Start,$startTime,$w3cTraceparent" > "$env:DATA_DIR\Idle\timestamps.csv"
+          echo "Idle_End,$endTime,$w3cTraceparent" >> "$env:DATA_DIR\Idle\timestamps.csv"
+        shell: powershell
+
+      # --- SCENARIO 2: PNPM INSTALL ---
+      - name: Profile PNPM Install
+        run: |
+          $w3cTraceparent = "00-$((New-Guid).Guid.Replace('-',''))-$(((New-Guid).Guid.Replace('-','')).Substring(0,16))-01"
+          $profilerCap = 900
+          $uprof = Start-Process -FilePath "$env:UPROF_PATH" -ArgumentList "timechart --event power --interval 100 -d $profilerCap -o `"$env:DATA_DIR\PNPM_Install\power_data.csv`"" -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 10
+          $startTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+          docker run --rm -v "${PWD}:/app" -w /app --platform linux/amd64 $env:NODE_IMAGE sh -c "corepack enable && corepack prepare pnpm@11.24.0 --activate && pnpm install --frozen-lockfile" ; $global:LASTEXITCODE = 0
+          $endTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+          Start-Sleep -Seconds 10
+          Stop-Process -Id $uprof.Id -Force -ErrorAction SilentlyContinue
+          echo "PNPM_Install_Start,$startTime,$w3cTraceparent" > "$env:DATA_DIR\PNPM_Install\timestamps.csv"
+          echo "PNPM_Install_End,$endTime,$w3cTraceparent" >> "$env:DATA_DIR\PNPM_Install\timestamps.csv"
+          $actualSec = ((Get-Date $endTime) - (Get-Date $startTime)).TotalSeconds
+          $usableCap = $profilerCap - 20
+          $truncated = $actualSec -gt $usableCap
+          . "$env:DATA_DIR\write-json.ps1"
+          Write-Utf8JsonNoBom "$env:DATA_DIR\PNPM_Install\duration_check.json" @{ task_seconds = [math]::Round($actualSec,2); profiler_cap_seconds = $profilerCap; usable_cap_seconds = $usableCap; truncated = $truncated }
+          if ($truncated) { Write-Error "TRUNCATED: PNPM_Install ran ${actualSec}s but usable cap was ${usableCap}s"; exit 1 }
+        shell: powershell
+
+      # --- SCENARIO 3: BUILD SERVER (NestJS) ---
+      - name: Profile Build Server
+        run: |
+          $w3cTraceparent = "00-$((New-Guid).Guid.Replace('-',''))-$(((New-Guid).Guid.Replace('-','')).Substring(0,16))-01"
+          $profilerCap = 600
+          $uprof = Start-Process -FilePath "$env:UPROF_PATH" -ArgumentList "timechart --event power --interval 100 -d $profilerCap -o `"$env:DATA_DIR\Build_Server\power_data.csv`"" -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 10
+          $startTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+          docker run --rm -v "${PWD}:/app" -w /app --platform linux/amd64 $env:NODE_IMAGE sh -c "corepack enable && corepack prepare pnpm@11.24.0 --activate && pnpm --filter @immich/plugin-sdk --filter @immich/plugin-core install --frozen-lockfile && pnpm --filter @immich/plugin-sdk --filter @immich/plugin-core build && pnpm --filter immich install --frozen-lockfile && pnpm --filter immich run build" ; $global:LASTEXITCODE = 0
+          $endTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+          Start-Sleep -Seconds 10
+          Stop-Process -Id $uprof.Id -Force -ErrorAction SilentlyContinue
+          echo "Build_Server_Start,$startTime,$w3cTraceparent" > "$env:DATA_DIR\Build_Server\timestamps.csv"
+          echo "Build_Server_End,$endTime,$w3cTraceparent" >> "$env:DATA_DIR\Build_Server\timestamps.csv"
+          $actualSec = ((Get-Date $endTime) - (Get-Date $startTime)).TotalSeconds
+          $usableCap = $profilerCap - 20
+          $truncated = $actualSec -gt $usableCap
+          . "$env:DATA_DIR\write-json.ps1"
+          Write-Utf8JsonNoBom "$env:DATA_DIR\Build_Server\duration_check.json" @{ task_seconds = [math]::Round($actualSec,2); profiler_cap_seconds = $profilerCap; usable_cap_seconds = $usableCap; truncated = $truncated }
+          if ($truncated) { Write-Error "TRUNCATED: Build_Server ran ${actualSec}s but usable cap was ${usableCap}s"; exit 1 }
+        shell: powershell
+
+      # --- SCENARIO 4: BUILD WEB (SvelteKit/Vite) ---
+      - name: Profile Build Web
+        run: |
+          $w3cTraceparent = "00-$((New-Guid).Guid.Replace('-',''))-$(((New-Guid).Guid.Replace('-','')).Substring(0,16))-01"
+          $profilerCap = 600
+          $uprof = Start-Process -FilePath "$env:UPROF_PATH" -ArgumentList "timechart --event power --interval 100 -d $profilerCap -o `"$env:DATA_DIR\Build_Web\power_data.csv`"" -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 10
+          $startTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+          docker run --rm -v "${PWD}:/app" -w /app --platform linux/amd64 $env:NODE_IMAGE sh -c "corepack enable && corepack prepare pnpm@11.24.0 --activate && pnpm --filter @immich/sdk install --frozen-lockfile && pnpm --filter @immich/sdk build && pnpm --filter immich-web install --frozen-lockfile && pnpm --filter immich-web run build" ; $global:LASTEXITCODE = 0
+          $endTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+          Start-Sleep -Seconds 10
+          Stop-Process -Id $uprof.Id -Force -ErrorAction SilentlyContinue
+          echo "Build_Web_Start,$startTime,$w3cTraceparent" > "$env:DATA_DIR\Build_Web\timestamps.csv"
+          echo "Build_Web_End,$endTime,$w3cTraceparent" >> "$env:DATA_DIR\Build_Web\timestamps.csv"
+          $actualSec = ((Get-Date $endTime) - (Get-Date $startTime)).TotalSeconds
+          $usableCap = $profilerCap - 20
+          $truncated = $actualSec -gt $usableCap
+          . "$env:DATA_DIR\write-json.ps1"
+          Write-Utf8JsonNoBom "$env:DATA_DIR\Build_Web\duration_check.json" @{ task_seconds = [math]::Round($actualSec,2); profiler_cap_seconds = $profilerCap; usable_cap_seconds = $usableCap; truncated = $truncated }
+          if ($truncated) { Write-Error "TRUNCATED: Build_Web ran ${actualSec}s but usable cap was ${usableCap}s"; exit 1 }
+        shell: powershell
+
+      # --- SCENARIO 5: TEST SERVER SPANS (Vitest per service group) ---
+      - name: Profile Test Server Spans
+        run: |
+          $scenario = "Test_Server_Spans"
+          $scenarioDir = Join-Path $env:DATA_DIR $scenario
+          $rawSpans = Join-Path $scenarioDir "pipeline_spans.ndjson"
+          $spansJson = Join-Path $scenarioDir "spans.json"
+          Remove-Item -LiteralPath $rawSpans, $spansJson -Force -ErrorAction SilentlyContinue
+
+          $w3cTraceparent = "00-$((New-Guid).Guid.Replace('-',''))-$(((New-Guid).Guid.Replace('-','')).Substring(0,16))-01"
+          $profilerCap = 2400
+          $uprof = Start-Process -FilePath "$env:UPROF_PATH" -ArgumentList "timechart --event power --interval 100 -d $profilerCap -o `"$scenarioDir\power_data.csv`"" -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 10
+
+          $failedSpanCount = 0
+          $scenarioStartClock = Get-Date
+          $startTime = $scenarioStartClock.ToString("yyyy-MM-dd HH:mm:ss.fff")
+          $startEpochMs = [DateTimeOffset]::new($scenarioStartClock, [System.TimeZoneInfo]::Local.GetUtcOffset($scenarioStartClock)).ToUnixTimeMilliseconds()
+
+          Write-Host "Starting persistent Node runner container..."
+          $containerId = [string](docker run -d -v "${PWD}:/app" -w /app --platform linux/amd64 $env:NODE_IMAGE sh -c "corepack enable && corepack prepare pnpm@11.24.0 --activate && sleep infinity" | Select-Object -Last 1)
+          $containerId = $containerId.Trim()
+          if ([string]::IsNullOrWhiteSpace($containerId)) { throw "Failed to start persistent Node container" }
+
+          # Wait for corepack setup
+          Start-Sleep -Seconds 10
+
+          # Pre-install dependencies and build SDK + plugins inside the container
+          Write-Host "Pre-installing dependencies and building SDK + plugins..."
+          docker exec $containerId sh -c "pnpm --filter @immich/plugin-sdk --filter @immich/plugin-core install --frozen-lockfile && pnpm --filter @immich/plugin-sdk --filter @immich/plugin-core build && pnpm --filter immich install --frozen-lockfile"
+
+          function Invoke-ServerSpan {
+            param(
+              [string]$Name,
+              [string]$TestPath,
+              [string[]]$VitestArgs,
+              [bool]$Calibration = $false
+            )
+            $startMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+            $execArgs = @("exec", $containerId, "sh", "-c", "cd /app/server && pnpm exec vitest run --config test/vitest.config.mjs $($VitestArgs -join ' ')")
+            & docker @execArgs
+            $exitCode = $LASTEXITCODE
+            $endMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+            if ($exitCode -ne 0 -and -not $Calibration) { $script:failedSpanCount += 1; Write-Warning "Span $Name exited $exitCode" }
+            $commandText = "pnpm exec vitest run --config test/vitest.config.mjs " + ($VitestArgs -join " ")
+            node scripts\make_pipeline_spans.js record `
+              --output "$rawSpans" --name "$Name" --start-ms "$startMs" --end-ms "$endMs" `
+              --exit-code "$exitCode" --test-path "$TestPath" --command "$commandText" `
+              --calibration "$Calibration" --operation "vitest-service-group"
+            if ($LASTEXITCODE -ne 0) { throw "Failed to record span $Name" }
+          }
+
+          # Calibration runs
+          for ($i = 1; $i -le 3; $i++) {
+            Invoke-ServerSpan -Name "vitest.server.Calibration.$i" -TestPath "" -VitestArgs @("--testPathPattern=^NO_MATCH$") -Calibration $true
+          }
+
+          # Server test groups — by service functional area
+          $testGroups = @{
+            "auth"     = "src/services/auth.service.spec.ts src/services/user.service.spec.ts src/services/user-admin.service.spec.ts src/services/session.service.spec.ts src/services/api-key.service.spec.ts"
+            "asset"    = "src/services/asset.service.spec.ts src/services/asset-media.service.spec.ts src/services/album.service.spec.ts src/services/activity.service.spec.ts"
+            "media"    = "src/services/media.service.spec.ts src/services/metadata.service.spec.ts src/services/transcoding.service.spec.ts src/services/hls.service.spec.ts src/services/storage-template.service.spec.ts"
+            "ai"       = "src/services/smart-info.service.spec.ts src/services/search.service.spec.ts src/services/person.service.spec.ts src/services/duplicate.service.spec.ts src/services/ocr.service.spec.ts"
+            "library"  = "src/services/library.service.spec.ts src/services/storage.service.spec.ts src/services/download.service.spec.ts src/services/database-backup.service.spec.ts src/services/database.service.spec.ts"
+            "system"   = "src/services/server.service.spec.ts src/services/system-config.service.spec.ts src/services/system-metadata.service.spec.ts src/services/job.service.spec.ts src/services/queue.service.spec.ts src/services/maintenance.service.spec.ts src/services/notification.service.spec.ts src/services/notification-admin.service.spec.ts"
+            "other"    = "src/services/tag.service.spec.ts src/services/stack.service.spec.ts src/services/memory.service.spec.ts src/services/partner.service.spec.ts src/services/shared-link.service.spec.ts src/services/cli.service.spec.ts src/services/trash.service.spec.ts src/services/timeline.service.spec.ts src/services/version.service.spec.ts src/services/view.service.spec.ts src/services/integrity.service.spec.ts src/services/sync.service.spec.ts src/services/map.service.spec.ts"
+          }
+
+          foreach ($group in @("auth", "asset", "media", "ai", "library", "system", "other")) {
+            $files = $testGroups[$group]
+            Invoke-ServerSpan -Name "vitest.server.$group" -TestPath "server/src/services/$group" -VitestArgs @($files)
+          }
+
+          $scenarioEndClock = Get-Date
+          $endTime = $scenarioEndClock.ToString("yyyy-MM-dd HH:mm:ss.fff")
+
+          docker stop $containerId | Out-Null
+          docker rm  $containerId | Out-Null
+
+          Start-Sleep -Seconds 10
+          Stop-Process -Id $uprof.Id -Force -ErrorAction SilentlyContinue
+
+          echo "${scenario}_Start,$startTime,$w3cTraceparent,$startEpochMs" > "$scenarioDir\timestamps.csv"
+          echo "${scenario}_End,$endTime,$w3cTraceparent" >> "$scenarioDir\timestamps.csv"
+
+          node scripts\make_pipeline_spans.js build --input "$rawSpans" --output "$spansJson" --traceparent "$w3cTraceparent" --scenario "$scenario"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to build spans.json for $scenario" }
+
+          $actualSec = ($scenarioEndClock - $scenarioStartClock).TotalSeconds
+          $usableCap = $profilerCap - 20
+          $truncated = $actualSec -gt $usableCap
+          $spanCount = @(Get-Content -LiteralPath $rawSpans | Where-Object { $_.Trim().Length -gt 0 }).Count
+          . "$env:DATA_DIR\write-json.ps1"
+          Write-Utf8JsonNoBom "$scenarioDir\duration_check.json" @{ scenario = $scenario; profiler_cap_seconds = $profilerCap; usable_cap_seconds = $usableCap; actual_duration_seconds = [math]::Round($actualSec,2); task_seconds = [math]::Round($actualSec,2); truncated = $truncated; span_count = $spanCount; failed_span_count = $failedSpanCount; calibration_repetitions = 3 }
+
+          if ($spanCount -ne 10) { Write-Error "Expected 10 spans but found $spanCount"; exit 1 }
+          if ($truncated) { Write-Error "TRUNCATED: Test_Server_Spans ran ${actualSec}s but usable cap was ${usableCap}s"; exit 1 }
+        shell: powershell
+
+      # --- SCENARIO 6: TEST WEB SPANS (Vitest per directory) ---
+      - name: Profile Test Web Spans
+        run: |
+          $scenario = "Test_Web_Spans"
+          $scenarioDir = Join-Path $env:DATA_DIR $scenario
+          $rawSpans = Join-Path $scenarioDir "pipeline_spans.ndjson"
+          $spansJson = Join-Path $scenarioDir "spans.json"
+          Remove-Item -LiteralPath $rawSpans, $spansJson -Force -ErrorAction SilentlyContinue
+
+          $w3cTraceparent = "00-$((New-Guid).Guid.Replace('-',''))-$(((New-Guid).Guid.Replace('-','')).Substring(0,16))-01"
+          $profilerCap = 1200
+          $uprof = Start-Process -FilePath "$env:UPROF_PATH" -ArgumentList "timechart --event power --interval 100 -d $profilerCap -o `"$scenarioDir\power_data.csv`"" -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 10
+
+          $failedSpanCount = 0
+          $scenarioStartClock = Get-Date
+          $startTime = $scenarioStartClock.ToString("yyyy-MM-dd HH:mm:ss.fff")
+          $startEpochMs = [DateTimeOffset]::new($scenarioStartClock, [System.TimeZoneInfo]::Local.GetUtcOffset($scenarioStartClock)).ToUnixTimeMilliseconds()
+
+          Write-Host "Starting persistent Node runner container..."
+          $containerId = [string](docker run -d -v "${PWD}:/app" -w /app --platform linux/amd64 $env:NODE_IMAGE sh -c "corepack enable && corepack prepare pnpm@11.24.0 --activate && sleep infinity" | Select-Object -Last 1)
+          $containerId = $containerId.Trim()
+          if ([string]::IsNullOrWhiteSpace($containerId)) { throw "Failed to start persistent Node container" }
+
+          # Wait for corepack setup
+          Start-Sleep -Seconds 10
+
+          # Pre-install SDK + web dependencies inside the container
+          Write-Host "Pre-installing SDK and web dependencies..."
+          docker exec $containerId sh -c "pnpm --filter @immich/sdk install --frozen-lockfile && pnpm --filter @immich/sdk build && pnpm --filter immich-web install --frozen-lockfile"
+
+          function Invoke-WebSpan {
+            param(
+              [string]$Name,
+              [string]$TestPath,
+              [string[]]$VitestArgs,
+              [bool]$Calibration = $false
+            )
+            $startMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+            $execArgs = @("exec", $containerId, "sh", "-c", "cd /app/web && pnpm exec vitest run $($VitestArgs -join ' ')")
+            & docker @execArgs
+            $exitCode = $LASTEXITCODE
+            $endMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+            if ($exitCode -ne 0 -and -not $Calibration) { $script:failedSpanCount += 1; Write-Warning "Span $Name exited $exitCode" }
+            $commandText = "pnpm exec vitest run " + ($VitestArgs -join " ")
+            node scripts\make_pipeline_spans.js record `
+              --output "$rawSpans" --name "$Name" --start-ms "$startMs" --end-ms "$endMs" `
+              --exit-code "$exitCode" --test-path "$TestPath" --command "$commandText" `
+              --calibration "$Calibration" --operation "vitest-directory"
+            if ($LASTEXITCODE -ne 0) { throw "Failed to record span $Name" }
+          }
+
+          # Calibration runs
+          for ($i = 1; $i -le 3; $i++) {
+            Invoke-WebSpan -Name "vitest.web.Calibration.$i" -TestPath "" -VitestArgs @("--testPathPattern=^NO_MATCH$") -Calibration $true
+          }
+
+          # Web test groups — by src/lib subdirectory
+          foreach ($dir in @("components", "utils", "stores", "services", "actions", "managers", "modals")) {
+            Invoke-WebSpan -Name "vitest.web.$dir" -TestPath "web/src/lib/$dir" -VitestArgs @("src/lib/$dir")
+          }
+
+          $scenarioEndClock = Get-Date
+          $endTime = $scenarioEndClock.ToString("yyyy-MM-dd HH:mm:ss.fff")
+
+          docker stop $containerId | Out-Null
+          docker rm  $containerId | Out-Null
+
+          Start-Sleep -Seconds 10
+          Stop-Process -Id $uprof.Id -Force -ErrorAction SilentlyContinue
+
+          echo "${scenario}_Start,$startTime,$w3cTraceparent,$startEpochMs" > "$scenarioDir\timestamps.csv"
+          echo "${scenario}_End,$endTime,$w3cTraceparent" >> "$scenarioDir\timestamps.csv"
+
+          node scripts\make_pipeline_spans.js build --input "$rawSpans" --output "$spansJson" --traceparent "$w3cTraceparent" --scenario "$scenario"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to build spans.json for $scenario" }
+
+          $actualSec = ($scenarioEndClock - $scenarioStartClock).TotalSeconds
+          $usableCap = $profilerCap - 20
+          $truncated = $actualSec -gt $usableCap
+          $spanCount = @(Get-Content -LiteralPath $rawSpans | Where-Object { $_.Trim().Length -gt 0 }).Count
+          . "$env:DATA_DIR\write-json.ps1"
+          Write-Utf8JsonNoBom "$scenarioDir\duration_check.json" @{ scenario = $scenario; profiler_cap_seconds = $profilerCap; usable_cap_seconds = $usableCap; actual_duration_seconds = [math]::Round($actualSec,2); task_seconds = [math]::Round($actualSec,2); truncated = $truncated; span_count = $spanCount; failed_span_count = $failedSpanCount; calibration_repetitions = 3 }
+
+          if ($spanCount -ne 10) { Write-Error "Expected 10 spans but found $spanCount"; exit 1 }
+          if ($truncated) { Write-Error "TRUNCATED: Test_Web_Spans ran ${actualSec}s but usable cap was ${usableCap}s"; exit 1 }
+        shell: powershell
+
+      - name: Upload Traces as Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: energy-traces-${{ env.RUN_ID }}
+          path: ${{ env.DATA_DIR }}
+          retention-days: 90
+
+      - name: Offload to MinIO Bucket
+        env:
+          AWS_ACCESS_KEY_ID: researcher
+          AWS_SECRET_ACCESS_KEY: supersecretpassword
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          Write-Host "Compressing Raw Telemetry..."
+          $scenarios = @("Idle", "PNPM_Install", "Build_Server", "Build_Web", "Test_Server_Spans", "Test_Web_Spans")
+          foreach ($scenario in $scenarios) {
+            $scenarioDir = Join-Path $env:DATA_DIR $scenario
+            $rootTimechart = Join-Path $scenarioDir "timechart.csv"
+            $timestamps = Join-Path $scenarioDir "timestamps.csv"
+
+            if (-not (Test-Path -LiteralPath $rootTimechart)) {
+              $nested = Get-ChildItem -LiteralPath $scenarioDir -Recurse -Filter "timechart.csv" -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+              if ($null -eq $nested) { throw "Missing timechart.csv for $scenario" }
+              Copy-Item -LiteralPath $nested.FullName -Destination $rootTimechart -Force
+            }
+
+            foreach ($f in @($rootTimechart, $timestamps)) {
+              if (-not (Test-Path -LiteralPath $f)) { throw "Missing: $f" }
+              if ((Get-Item -LiteralPath $f).Length -eq 0) { throw "Empty: $f" }
+            }
+
+            $files = @($rootTimechart, $timestamps)
+            $durationCheck = Join-Path $scenarioDir "duration_check.json"
+            if (Test-Path -LiteralPath $durationCheck) { $files += $durationCheck }
+            foreach ($spanScenario in @("Test_Server_Spans", "Test_Web_Spans")) {
+              if ($scenario -eq $spanScenario) {
+                $spansJson = Join-Path $scenarioDir "spans.json"
+                if (-not (Test-Path -LiteralPath $spansJson)) { throw "Missing spans.json for $scenario" }
+                if ((Get-Item -LiteralPath $spansJson).Length -eq 0) { throw "Empty spans.json for $scenario" }
+                $files += $spansJson
+              }
+            }
+            Compress-Archive -LiteralPath $files -DestinationPath "$env:DATA_DIR\$scenario.zip" -Force
+          }
+
+          $awsExe = "C:\Program Files\Amazon\AWSCLIV2\aws.exe"
+          & $awsExe s3 cp "$env:DATA_DIR\hardware_metadata.json" "s3://energy-research-data/raw-telemetry/$env:PROJECT_NAME/$env:RUN_ID/hardware_metadata.json" --endpoint-url http://100.100.223.40:9000
+          foreach ($scenario in $scenarios) {
+            & $awsExe s3 cp "$env:DATA_DIR\$scenario.zip" "s3://energy-research-data/raw-telemetry/$env:PROJECT_NAME/$env:RUN_ID/$scenario.zip" --endpoint-url http://100.100.223.40:9000
+          }
+          Remove-Item -Path "$env:DATA_DIR" -Recurse -Force
+        shell: powershell
+
+  profile-mac:
+    name: Profile Apple Mac M2
+    runs-on: [self-hosted, macos]
+    permissions:
+      contents: write
+
+    env:
+      PROJECT_NAME: "immich"
+      RUN_ID: "mac_${{ github.run_id }}"
+      DATA_DIR: "${{ github.workspace }}/ResearchData/cpudata/mac_${{ github.run_id }}"
+      NODE_IMAGE: "node:22-slim"
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Prepare Directory Structure
+        run: |
+          mkdir -p "$DATA_DIR/Idle"
+          mkdir -p "$DATA_DIR/PNPM_Install"
+          mkdir -p "$DATA_DIR/Build_Server"
+          mkdir -p "$DATA_DIR/Build_Web"
+          mkdir -p "$DATA_DIR/Test_Server_Spans"
+          mkdir -p "$DATA_DIR/Test_Web_Spans"
+        shell: bash
+
+      - name: Capture Hardware Metadata
+        run: |
+          META_FILE="$DATA_DIR/hardware_metadata.json"
+          CPU_MODEL=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "Apple Silicon")
+          TOTAL_CORES=$(sysctl -n hw.physicalcpu)
+          CPU_THREADS=$(sysctl -n hw.logicalcpu)
+          RAM_GB=$(echo "scale=1; $(sysctl -n hw.memsize) / 1073741824" | bc)
+          OS_VER=$(sw_vers -productVersion)
+          DOCKER_VER=$(docker --version)
+          cat > "$META_FILE" << EOFMETA
+          {
+            "platform": "mac_m2_macos",
+            "captured_at": "$(date '+%Y-%m-%d %H:%M:%S')",
+            "cpu_model": "$CPU_MODEL",
+            "cpu_cores": $TOTAL_CORES,
+            "cpu_threads": $CPU_THREADS,
+            "ram_gb": $RAM_GB,
+            "os_version": "macOS $OS_VER",
+            "docker_ver": "$DOCKER_VER"
+          }
+          EOFMETA
+        shell: bash
+
+      - name: Pre-pull Images
+        run: |
+          docker pull --platform linux/arm64 "$NODE_IMAGE"
+        shell: bash
+
+      # --- SCENARIO 1: IDLE ---
+      - name: Profile Idle Scenario
+        run: |
+          W3C_TRACEPARENT="00-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' | cut -c1-16)-01"
+          sudo powermetrics --samplers cpu_power -i 100 -n 600 > "$DATA_DIR/Idle/power_data.txt" 2>/dev/null &
+          PROF_PID=$!
+          sleep 10
+          START_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          sleep 30
+          END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          sleep 10
+          sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
+          echo "Idle_Start,$START_TIME,$W3C_TRACEPARENT" > "$DATA_DIR/Idle/timestamps.csv"
+          echo "Idle_End,$END_TIME,$W3C_TRACEPARENT" >> "$DATA_DIR/Idle/timestamps.csv"
+        shell: bash
+
+      # --- SCENARIO 2: PNPM INSTALL ---
+      - name: Profile PNPM Install
+        run: |
+          W3C_TRACEPARENT="00-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' | cut -c1-16)-01"
+          PROFILER_CAP=900
+          sudo powermetrics --samplers cpu_power -i 100 -n $((PROFILER_CAP * 10)) > "$DATA_DIR/PNPM_Install/power_data.txt" 2>/dev/null &
+          PROF_PID=$!
+          sleep 10
+          START_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          docker run --rm -v "${PWD}:/app" -w /app --platform linux/arm64 "$NODE_IMAGE" sh -c "corepack enable && corepack prepare pnpm@11.24.0 --activate && pnpm install --frozen-lockfile" || true
+          END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          sleep 10
+          sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
+          echo "PNPM_Install_Start,$START_TIME,$W3C_TRACEPARENT" > "$DATA_DIR/PNPM_Install/timestamps.csv"
+          echo "PNPM_Install_End,$END_TIME,$W3C_TRACEPARENT" >> "$DATA_DIR/PNPM_Install/timestamps.csv"
+          ACTUAL_SEC=$(python3 -c "from datetime import datetime; s=datetime.strptime('$START_TIME','%Y-%m-%d %H:%M:%S.%f'); e=datetime.strptime('$END_TIME','%Y-%m-%d %H:%M:%S.%f'); print(round((e-s).total_seconds(),2))")
+          USABLE_CAP=$((PROFILER_CAP - 20))
+          TRUNCATED=$(python3 -c "print('true' if $ACTUAL_SEC > $USABLE_CAP else 'false')")
+          echo "{\"task_seconds\": $ACTUAL_SEC, \"profiler_cap_seconds\": $PROFILER_CAP, \"usable_cap_seconds\": $USABLE_CAP, \"truncated\": $TRUNCATED}" > "$DATA_DIR/PNPM_Install/duration_check.json"
+          if [ "$TRUNCATED" = "true" ]; then echo "TRUNCATED: PNPM_Install ran ${ACTUAL_SEC}s but usable cap was ${USABLE_CAP}s"; exit 1; fi
+        shell: bash
+
+      # --- SCENARIO 3: BUILD SERVER (NestJS) ---
+      - name: Profile Build Server
+        run: |
+          W3C_TRACEPARENT="00-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' | cut -c1-16)-01"
+          PROFILER_CAP=600
+          sudo powermetrics --samplers cpu_power -i 100 -n $((PROFILER_CAP * 10)) > "$DATA_DIR/Build_Server/power_data.txt" 2>/dev/null &
+          PROF_PID=$!
+          sleep 10
+          START_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          docker run --rm -v "${PWD}:/app" -w /app --platform linux/arm64 "$NODE_IMAGE" sh -c "corepack enable && corepack prepare pnpm@11.24.0 --activate && pnpm --filter @immich/plugin-sdk --filter @immich/plugin-core install --frozen-lockfile && pnpm --filter @immich/plugin-sdk --filter @immich/plugin-core build && pnpm --filter immich install --frozen-lockfile && pnpm --filter immich run build" || true
+          END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          sleep 10
+          sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
+          echo "Build_Server_Start,$START_TIME,$W3C_TRACEPARENT" > "$DATA_DIR/Build_Server/timestamps.csv"
+          echo "Build_Server_End,$END_TIME,$W3C_TRACEPARENT" >> "$DATA_DIR/Build_Server/timestamps.csv"
+          ACTUAL_SEC=$(python3 -c "from datetime import datetime; s=datetime.strptime('$START_TIME','%Y-%m-%d %H:%M:%S.%f'); e=datetime.strptime('$END_TIME','%Y-%m-%d %H:%M:%S.%f'); print(round((e-s).total_seconds(),2))")
+          USABLE_CAP=$((PROFILER_CAP - 20))
+          TRUNCATED=$(python3 -c "print('true' if $ACTUAL_SEC > $USABLE_CAP else 'false')")
+          echo "{\"task_seconds\": $ACTUAL_SEC, \"profiler_cap_seconds\": $PROFILER_CAP, \"usable_cap_seconds\": $USABLE_CAP, \"truncated\": $TRUNCATED}" > "$DATA_DIR/Build_Server/duration_check.json"
+          if [ "$TRUNCATED" = "true" ]; then echo "TRUNCATED: Build_Server ran ${ACTUAL_SEC}s but usable cap was ${USABLE_CAP}s"; exit 1; fi
+        shell: bash
+
+      # --- SCENARIO 4: BUILD WEB (SvelteKit/Vite) ---
+      - name: Profile Build Web
+        run: |
+          W3C_TRACEPARENT="00-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' | cut -c1-16)-01"
+          PROFILER_CAP=600
+          sudo powermetrics --samplers cpu_power -i 100 -n $((PROFILER_CAP * 10)) > "$DATA_DIR/Build_Web/power_data.txt" 2>/dev/null &
+          PROF_PID=$!
+          sleep 10
+          START_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          docker run --rm -v "${PWD}:/app" -w /app --platform linux/arm64 "$NODE_IMAGE" sh -c "corepack enable && corepack prepare pnpm@11.24.0 --activate && pnpm --filter @immich/sdk install --frozen-lockfile && pnpm --filter @immich/sdk build && pnpm --filter immich-web install --frozen-lockfile && pnpm --filter immich-web run build" || true
+          END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          sleep 10
+          sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
+          echo "Build_Web_Start,$START_TIME,$W3C_TRACEPARENT" > "$DATA_DIR/Build_Web/timestamps.csv"
+          echo "Build_Web_End,$END_TIME,$W3C_TRACEPARENT" >> "$DATA_DIR/Build_Web/timestamps.csv"
+          ACTUAL_SEC=$(python3 -c "from datetime import datetime; s=datetime.strptime('$START_TIME','%Y-%m-%d %H:%M:%S.%f'); e=datetime.strptime('$END_TIME','%Y-%m-%d %H:%M:%S.%f'); print(round((e-s).total_seconds(),2))")
+          USABLE_CAP=$((PROFILER_CAP - 20))
+          TRUNCATED=$(python3 -c "print('true' if $ACTUAL_SEC > $USABLE_CAP else 'false')")
+          echo "{\"task_seconds\": $ACTUAL_SEC, \"profiler_cap_seconds\": $PROFILER_CAP, \"usable_cap_seconds\": $USABLE_CAP, \"truncated\": $TRUNCATED}" > "$DATA_DIR/Build_Web/duration_check.json"
+          if [ "$TRUNCATED" = "true" ]; then echo "TRUNCATED: Build_Web ran ${ACTUAL_SEC}s but usable cap was ${USABLE_CAP}s"; exit 1; fi
+        shell: bash
+
+      # --- SCENARIO 5: TEST SERVER SPANS (Vitest per service group) ---
+      - name: Profile Test Server Spans
+        run: |
+          set -euo pipefail
+          SCENARIO="Test_Server_Spans"
+          SCENARIO_DIR="$DATA_DIR/$SCENARIO"
+          RAW_SPANS="$SCENARIO_DIR/pipeline_spans.ndjson"
+          SPANS_JSON="$SCENARIO_DIR/spans.json"
+          rm -f "$RAW_SPANS" "$SPANS_JSON"
+
+          W3C_TRACEPARENT="00-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' | cut -c1-16)-01"
+          PROFILER_CAP=2400
+          sudo powermetrics --samplers cpu_power -i 100 -n $((PROFILER_CAP * 10)) > "$SCENARIO_DIR/power_data.txt" 2>/dev/null &
+          PROF_PID=$!
+          sleep 10
+
+          FAILED_SPAN_COUNT=0
+          START_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          START_EPOCH_MS=$(node -e "console.log(Date.now())")
+
+          CONTAINER_ID=$(docker run -d -v "${PWD}:/app" -w /app --platform linux/arm64 "$NODE_IMAGE" sh -c "corepack enable && corepack prepare pnpm@11.24.0 --activate && sleep infinity")
+          CONTAINER_ID=$(echo "$CONTAINER_ID" | tr -d '[:space:]')
+          if [ -z "$CONTAINER_ID" ]; then echo "Failed to start persistent Node container"; exit 1; fi
+
+          # Wait for corepack setup
+          sleep 10
+
+          # Pre-install dependencies and build SDK + plugins inside the container
+          echo "Pre-installing dependencies and building SDK + plugins..."
+          docker exec "$CONTAINER_ID" sh -c "pnpm --filter @immich/plugin-sdk --filter @immich/plugin-core install --frozen-lockfile && pnpm --filter @immich/plugin-sdk --filter @immich/plugin-core build && pnpm --filter immich install --frozen-lockfile"
+
+          run_server_span() {
+            local name="$1" calibration="$2" test_path="$3"
+            shift 3
+            local vitest_args="$*"
+            local start_ms end_ms exit_code
+            start_ms=$(node -e "console.log(Date.now())")
+            set +e
+            docker exec "$CONTAINER_ID" sh -c "cd /app/server && pnpm exec vitest run --config test/vitest.config.mjs $vitest_args"
+            exit_code=$?
+            set -e
+            end_ms=$(node -e "console.log(Date.now())")
+            if [ "$exit_code" -ne 0 ] && [ "$calibration" != "true" ]; then
+              FAILED_SPAN_COUNT=$((FAILED_SPAN_COUNT + 1))
+              echo "WARNING: Span $name exited $exit_code"
+            fi
+            node scripts/make_pipeline_spans.js record \
+              --output "$RAW_SPANS" --name "$name" --start-ms "$start_ms" --end-ms "$end_ms" \
+              --exit-code "$exit_code" --test-path "$test_path" --command "pnpm exec vitest run --config test/vitest.config.mjs $vitest_args" \
+              --calibration "$calibration" --operation "vitest-service-group"
+          }
+
+          # Calibration runs
+          for REP in 1 2 3; do
+            run_server_span "vitest.server.Calibration.$REP" "true" "" --testPathPattern="^NO_MATCH$"
+          done
+
+          # Server test groups — by service functional area
+          run_server_span "vitest.server.auth" "false" "server/src/services/auth" \
+            src/services/auth.service.spec.ts src/services/user.service.spec.ts src/services/user-admin.service.spec.ts src/services/session.service.spec.ts src/services/api-key.service.spec.ts
+
+          run_server_span "vitest.server.asset" "false" "server/src/services/asset" \
+            src/services/asset.service.spec.ts src/services/asset-media.service.spec.ts src/services/album.service.spec.ts src/services/activity.service.spec.ts
+
+          run_server_span "vitest.server.media" "false" "server/src/services/media" \
+            src/services/media.service.spec.ts src/services/metadata.service.spec.ts src/services/transcoding.service.spec.ts src/services/hls.service.spec.ts src/services/storage-template.service.spec.ts
+
+          run_server_span "vitest.server.ai" "false" "server/src/services/ai" \
+            src/services/smart-info.service.spec.ts src/services/search.service.spec.ts src/services/person.service.spec.ts src/services/duplicate.service.spec.ts src/services/ocr.service.spec.ts
+
+          run_server_span "vitest.server.library" "false" "server/src/services/library" \
+            src/services/library.service.spec.ts src/services/storage.service.spec.ts src/services/download.service.spec.ts src/services/database-backup.service.spec.ts src/services/database.service.spec.ts
+
+          run_server_span "vitest.server.system" "false" "server/src/services/system" \
+            src/services/server.service.spec.ts src/services/system-config.service.spec.ts src/services/system-metadata.service.spec.ts src/services/job.service.spec.ts src/services/queue.service.spec.ts src/services/maintenance.service.spec.ts src/services/notification.service.spec.ts src/services/notification-admin.service.spec.ts
+
+          run_server_span "vitest.server.other" "false" "server/src/services/other" \
+            src/services/tag.service.spec.ts src/services/stack.service.spec.ts src/services/memory.service.spec.ts src/services/partner.service.spec.ts src/services/shared-link.service.spec.ts src/services/cli.service.spec.ts src/services/trash.service.spec.ts src/services/timeline.service.spec.ts src/services/version.service.spec.ts src/services/view.service.spec.ts src/services/integrity.service.spec.ts src/services/sync.service.spec.ts src/services/map.service.spec.ts
+
+          END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+
+          docker stop "$CONTAINER_ID" >/dev/null 2>&1 || true
+          docker rm "$CONTAINER_ID" >/dev/null 2>&1 || true
+
+          sleep 10
+          sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
+
+          echo "${SCENARIO}_Start,$START_TIME,$W3C_TRACEPARENT,$START_EPOCH_MS" > "$SCENARIO_DIR/timestamps.csv"
+          echo "${SCENARIO}_End,$END_TIME,$W3C_TRACEPARENT" >> "$SCENARIO_DIR/timestamps.csv"
+
+          node scripts/make_pipeline_spans.js build --input "$RAW_SPANS" --output "$SPANS_JSON" --traceparent "$W3C_TRACEPARENT" --scenario "$SCENARIO"
+
+          ACTUAL_SEC=$(python3 -c "from datetime import datetime; s=datetime.strptime('$START_TIME','%Y-%m-%d %H:%M:%S.%f'); e=datetime.strptime('$END_TIME','%Y-%m-%d %H:%M:%S.%f'); print(round((e-s).total_seconds(),2))")
+          USABLE_CAP=$((PROFILER_CAP - 20))
+          TRUNCATED=$(python3 -c "print('true' if $ACTUAL_SEC > $USABLE_CAP else 'false')")
+          SPAN_COUNT=$(grep -cve '^[[:space:]]*$' "$RAW_SPANS")
+          cat > "$SCENARIO_DIR/duration_check.json" << EOFJSON
+          {"scenario": "$SCENARIO", "profiler_cap_seconds": $PROFILER_CAP, "usable_cap_seconds": $USABLE_CAP, "actual_duration_seconds": $ACTUAL_SEC, "task_seconds": $ACTUAL_SEC, "truncated": $TRUNCATED, "span_count": $SPAN_COUNT, "failed_span_count": $FAILED_SPAN_COUNT, "calibration_repetitions": 3}
+          EOFJSON
+
+          if [ "$SPAN_COUNT" -ne 10 ]; then echo "Expected 10 spans but found $SPAN_COUNT"; exit 1; fi
+          if [ "$TRUNCATED" = "true" ]; then echo "TRUNCATED: Test_Server_Spans ran ${ACTUAL_SEC}s but usable cap was ${USABLE_CAP}s"; exit 1; fi
+        shell: bash
+
+      # --- SCENARIO 6: TEST WEB SPANS (Vitest per directory) ---
+      - name: Profile Test Web Spans
+        run: |
+          set -euo pipefail
+          SCENARIO="Test_Web_Spans"
+          SCENARIO_DIR="$DATA_DIR/$SCENARIO"
+          RAW_SPANS="$SCENARIO_DIR/pipeline_spans.ndjson"
+          SPANS_JSON="$SCENARIO_DIR/spans.json"
+          rm -f "$RAW_SPANS" "$SPANS_JSON"
+
+          W3C_TRACEPARENT="00-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' | cut -c1-16)-01"
+          PROFILER_CAP=1200
+          sudo powermetrics --samplers cpu_power -i 100 -n $((PROFILER_CAP * 10)) > "$SCENARIO_DIR/power_data.txt" 2>/dev/null &
+          PROF_PID=$!
+          sleep 10
+
+          FAILED_SPAN_COUNT=0
+          START_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+          START_EPOCH_MS=$(node -e "console.log(Date.now())")
+
+          CONTAINER_ID=$(docker run -d -v "${PWD}:/app" -w /app --platform linux/arm64 "$NODE_IMAGE" sh -c "corepack enable && corepack prepare pnpm@11.24.0 --activate && sleep infinity")
+          CONTAINER_ID=$(echo "$CONTAINER_ID" | tr -d '[:space:]')
+          if [ -z "$CONTAINER_ID" ]; then echo "Failed to start persistent Node container"; exit 1; fi
+
+          # Wait for corepack setup
+          sleep 10
+
+          # Pre-install SDK + web dependencies inside the container
+          echo "Pre-installing SDK and web dependencies..."
+          docker exec "$CONTAINER_ID" sh -c "pnpm --filter @immich/sdk install --frozen-lockfile && pnpm --filter @immich/sdk build && pnpm --filter immich-web install --frozen-lockfile"
+
+          run_web_span() {
+            local name="$1" calibration="$2" test_path="$3"
+            shift 3
+            local vitest_args="$*"
+            local start_ms end_ms exit_code
+            start_ms=$(node -e "console.log(Date.now())")
+            set +e
+            docker exec "$CONTAINER_ID" sh -c "cd /app/web && pnpm exec vitest run $vitest_args"
+            exit_code=$?
+            set -e
+            end_ms=$(node -e "console.log(Date.now())")
+            if [ "$exit_code" -ne 0 ] && [ "$calibration" != "true" ]; then
+              FAILED_SPAN_COUNT=$((FAILED_SPAN_COUNT + 1))
+              echo "WARNING: Span $name exited $exit_code"
+            fi
+            node scripts/make_pipeline_spans.js record \
+              --output "$RAW_SPANS" --name "$name" --start-ms "$start_ms" --end-ms "$end_ms" \
+              --exit-code "$exit_code" --test-path "$test_path" --command "pnpm exec vitest run $vitest_args" \
+              --calibration "$calibration" --operation "vitest-directory"
+          }
+
+          # Calibration runs
+          for REP in 1 2 3; do
+            run_web_span "vitest.web.Calibration.$REP" "true" "" --testPathPattern="^NO_MATCH$"
+          done
+
+          # Web test groups — by src/lib subdirectory
+          for DIR in components utils stores services actions managers modals; do
+            run_web_span "vitest.web.$DIR" "false" "web/src/lib/$DIR" "src/lib/$DIR"
+          done
+
+          END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
+
+          docker stop "$CONTAINER_ID" >/dev/null 2>&1 || true
+          docker rm "$CONTAINER_ID" >/dev/null 2>&1 || true
+
+          sleep 10
+          sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
+
+          echo "${SCENARIO}_Start,$START_TIME,$W3C_TRACEPARENT,$START_EPOCH_MS" > "$SCENARIO_DIR/timestamps.csv"
+          echo "${SCENARIO}_End,$END_TIME,$W3C_TRACEPARENT" >> "$SCENARIO_DIR/timestamps.csv"
+
+          node scripts/make_pipeline_spans.js build --input "$RAW_SPANS" --output "$SPANS_JSON" --traceparent "$W3C_TRACEPARENT" --scenario "$SCENARIO"
+
+          ACTUAL_SEC=$(python3 -c "from datetime import datetime; s=datetime.strptime('$START_TIME','%Y-%m-%d %H:%M:%S.%f'); e=datetime.strptime('$END_TIME','%Y-%m-%d %H:%M:%S.%f'); print(round((e-s).total_seconds(),2))")
+          USABLE_CAP=$((PROFILER_CAP - 20))
+          TRUNCATED=$(python3 -c "print('true' if $ACTUAL_SEC > $USABLE_CAP else 'false')")
+          SPAN_COUNT=$(grep -cve '^[[:space:]]*$' "$RAW_SPANS")
+          cat > "$SCENARIO_DIR/duration_check.json" << EOFJSON
+          {"scenario": "$SCENARIO", "profiler_cap_seconds": $PROFILER_CAP, "usable_cap_seconds": $USABLE_CAP, "actual_duration_seconds": $ACTUAL_SEC, "task_seconds": $ACTUAL_SEC, "truncated": $TRUNCATED, "span_count": $SPAN_COUNT, "failed_span_count": $FAILED_SPAN_COUNT, "calibration_repetitions": 3}
+          EOFJSON
+
+          if [ "$SPAN_COUNT" -ne 10 ]; then echo "Expected 10 spans but found $SPAN_COUNT"; exit 1; fi
+          if [ "$TRUNCATED" = "true" ]; then echo "TRUNCATED: Test_Web_Spans ran ${ACTUAL_SEC}s but usable cap was ${USABLE_CAP}s"; exit 1; fi
+        shell: bash
+
+      - name: Cleanup Infrastructure
+        if: always()
+        run: |
+          docker ps -q --filter "ancestor=$NODE_IMAGE" | xargs -r docker stop 2>/dev/null || true
+          docker ps -aq --filter "ancestor=$NODE_IMAGE" | xargs -r docker rm 2>/dev/null || true
+          echo "Infrastructure cleaned up."
+        shell: bash
+
+      # --- CONVERT: powermetrics → timechart.csv ---
+      - name: Convert powermetrics to timechart.csv
+        if: always()
+        run: python3 scripts/parse_powermetrics.py "$RUN_ID"
+        shell: bash
+
+      - name: Validate Converted Data
+        if: always()
+        run: |
+          set -euo pipefail
+          FAIL=0
+          for SCENARIO in Idle PNPM_Install Build_Server Build_Web Test_Server_Spans Test_Web_Spans; do
+            CSV="$DATA_DIR/$SCENARIO/timechart.csv"
+            TS="$DATA_DIR/$SCENARIO/timestamps.csv"
+            if [ ! -s "$CSV" ]; then echo "ERROR: MISSING or EMPTY: $CSV"; FAIL=1
+            else
+              ROWS=$(tail -n +3 "$CSV" | wc -l | tr -d ' ')
+              if [ "$ROWS" -lt 1 ]; then echo "ERROR: $CSV has 0 data rows"; FAIL=1
+              else echo "OK: $SCENARIO: $ROWS data rows"; fi
+            fi
+            if [ ! -s "$TS" ]; then echo "ERROR: MISSING or EMPTY: $TS"; FAIL=1; fi
+            if [ "$SCENARIO" = "Test_Server_Spans" ] || [ "$SCENARIO" = "Test_Web_Spans" ]; then
+              if [ ! -s "$DATA_DIR/$SCENARIO/spans.json" ]; then echo "ERROR: MISSING or EMPTY: $SCENARIO/spans.json"; FAIL=1; fi
+            fi
+          done
+          if [ $FAIL -eq 1 ]; then echo "ERROR: VALIDATION FAILED — corrupt data will NOT be uploaded"; exit 1
+          else echo "OK: All telemetry files validated successfully"; fi
+        shell: bash
+
+      - name: Upload Traces as Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: energy-traces-${{ env.RUN_ID }}
+          path: ${{ env.DATA_DIR }}
+          retention-days: 90
+
+      - name: Offload to MinIO Bucket
+        run: |
+          set -euo pipefail
+          for SCENARIO in Idle PNPM_Install Build_Server Build_Web Test_Server_Spans Test_Web_Spans; do
+            SCENARIO_DIR="$DATA_DIR/$SCENARIO"
+            for REQUIRED in "$SCENARIO_DIR/timechart.csv" "$SCENARIO_DIR/timestamps.csv"; do
+              if [ ! -s "$REQUIRED" ]; then echo "ERROR: Missing or empty: $REQUIRED"; exit 1; fi
+            done
+            FILES=("$SCENARIO_DIR/timechart.csv" "$SCENARIO_DIR/timestamps.csv")
+            if [ -f "$SCENARIO_DIR/duration_check.json" ]; then FILES+=("$SCENARIO_DIR/duration_check.json"); fi
+            if [ "$SCENARIO" = "Test_Server_Spans" ] || [ "$SCENARIO" = "Test_Web_Spans" ]; then
+              if [ ! -s "$SCENARIO_DIR/spans.json" ]; then echo "ERROR: Missing spans.json for $SCENARIO"; exit 1; fi
+              FILES+=("$SCENARIO_DIR/spans.json")
+            fi
+            zip -j "$DATA_DIR/${SCENARIO}.zip" "${FILES[@]}"
+            zip -T "$DATA_DIR/${SCENARIO}.zip"
+          done
+
+          docker run --rm -v "$DATA_DIR:/data" --entrypoint sh minio/mc -c "\
+            mc alias set myminio http://100.100.223.40:9000 researcher supersecretpassword && \
+            mc cp /data/hardware_metadata.json myminio/energy-research-data/raw-telemetry/$PROJECT_NAME/$RUN_ID/hardware_metadata.json && \
+            mc cp /data/Idle.zip                    myminio/energy-research-data/raw-telemetry/$PROJECT_NAME/$RUN_ID/Idle.zip && \
+            mc cp /data/PNPM_Install.zip            myminio/energy-research-data/raw-telemetry/$PROJECT_NAME/$RUN_ID/PNPM_Install.zip && \
+            mc cp /data/Build_Server.zip            myminio/energy-research-data/raw-telemetry/$PROJECT_NAME/$RUN_ID/Build_Server.zip && \
+            mc cp /data/Build_Web.zip               myminio/energy-research-data/raw-telemetry/$PROJECT_NAME/$RUN_ID/Build_Web.zip && \
+            mc cp /data/Test_Server_Spans.zip       myminio/energy-research-data/raw-telemetry/$PROJECT_NAME/$RUN_ID/Test_Server_Spans.zip && \
+            mc cp /data/Test_Web_Spans.zip          myminio/energy-research-data/raw-telemetry/$PROJECT_NAME/$RUN_ID/Test_Web_Spans.zip"
+
+          rm -rf "$DATA_DIR"
+        shell: bash
