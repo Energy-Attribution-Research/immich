@@ -535,17 +535,65 @@ jobs:
           SPANS_JSON="$SCENARIO_DIR/spans.json"
           rm -f "$RAW_SPANS" "$SPANS_JSON"
 
-          # Cleanup trap — ensure profiler and container are stopped on any failure
-          cleanup_span_run() {
-            status=$?
+          FINALIZED=0
+
+          finalize_span_run() {
+            local status="${1:-0}"
+            if [ "$FINALIZED" -eq 1 ]; then return; fi
+            FINALIZED=1
+
+            END_TIME="${END_TIME:-$(python3 -c \
+              "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")}"
+
+            # Stop the container and profiler before generating output
             if [ -n "${CONTAINER_ID:-}" ]; then
               docker stop "$CONTAINER_ID" >/dev/null 2>&1 || true
               docker rm "$CONTAINER_ID" >/dev/null 2>&1 || true
             fi
+            sleep 10
             if [ -n "${PROF_PID:-}" ]; then
               sudo kill "$PROF_PID" 2>/dev/null || true
               wait "$PROF_PID" 2>/dev/null || true
             fi
+
+            # Always write timestamps, even if a test group failed
+            {
+              echo "${SCENARIO}_Start,${START_TIME:-$END_TIME},${W3C_TRACEPARENT:-},${START_EPOCH_MS:-}"
+              echo "${SCENARIO}_End,$END_TIME,${W3C_TRACEPARENT:-}"
+            } > "$SCENARIO_DIR/timestamps.csv"
+
+            # Build spans if records exist; do not hide the original failure
+            if [ -s "$RAW_SPANS" ]; then
+              node scripts/make_pipeline_spans.js build \
+                --input "$RAW_SPANS" --output "$SPANS_JSON" \
+                --traceparent "${W3C_TRACEPARENT:-}" --scenario "$SCENARIO" || true
+            fi
+
+            # Preserve a valid JSON file when span conversion itself fails
+            if [ ! -s "$SPANS_JSON" ]; then
+              printf '{"scenario":"%s","spans":[],"incomplete":true}\n' "$SCENARIO" > "$SPANS_JSON"
+            fi
+
+            # Write duration check
+            local actual_sec usable_cap truncated_flag span_count
+            actual_sec=$(python3 -c "from datetime import datetime; s=datetime.strptime('${START_TIME:-$END_TIME}','%Y-%m-%d %H:%M:%S.%f'); e=datetime.strptime('$END_TIME','%Y-%m-%d %H:%M:%S.%f'); print(round((e-s).total_seconds(),2))")
+            usable_cap=$((PROFILER_CAP - 20))
+            truncated_flag=$(python3 -c "print('true' if $actual_sec > $usable_cap else 'false')")
+            span_count=0
+            if [ -s "$RAW_SPANS" ]; then
+              span_count=$(grep -cve '^[[:space:]]*$' "$RAW_SPANS" || echo 0)
+            fi
+            cat > "$SCENARIO_DIR/duration_check.json" << EOFJSON
+            {"scenario": "$SCENARIO", "profiler_cap_seconds": $PROFILER_CAP, "usable_cap_seconds": $usable_cap, "actual_duration_seconds": $actual_sec, "task_seconds": $actual_sec, "truncated": $truncated_flag, "span_count": $span_count, "failed_span_count": $FAILED_SPAN_COUNT, "calibration_repetitions": 3}
+          EOFJSON
+
+            return "$status"
+          }
+
+          cleanup_span_run() {
+            local status=$?
+            trap - EXIT
+            finalize_span_run "$status" || true
             exit "$status"
           }
           trap cleanup_span_run EXIT
@@ -612,10 +660,13 @@ jobs:
               FAILED_SPAN_COUNT=$((FAILED_SPAN_COUNT + 1))
               echo "WARNING: Span $name exited $exit_code"
             fi
-            node scripts/make_pipeline_spans.js record \
-              --output "$RAW_SPANS" --name "$name" --start-ms "$start_ms" --end-ms "$end_ms" \
-              --exit-code "$exit_code" --test-path "$test_path" --command "pnpm exec vitest run --config test/vitest.config.mjs $vitest_args" \
-              --calibration "$calibration" --operation "vitest-service-group"
+            # Recording failure is infrastructure failure — do not let it kill remaining spans
+            if ! node scripts/make_pipeline_spans.js record \
+                --output "$RAW_SPANS" --name "$name" --start-ms "$start_ms" --end-ms "$end_ms" \
+                --exit-code "$exit_code" --test-path "$test_path" --command "pnpm exec vitest run --config test/vitest.config.mjs $vitest_args" \
+                --calibration "$calibration" --operation "vitest-service-group"; then
+              echo "ERROR: Failed to record span $name"
+            fi
           }
 
           # Calibration runs
@@ -647,26 +698,16 @@ jobs:
 
           END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
 
-          docker stop "$CONTAINER_ID" >/dev/null 2>&1 || true
-          docker rm "$CONTAINER_ID" >/dev/null 2>&1 || true
+          # Normal-path finalization — uses the same function as the trap
+          finalize_span_run 0
+          trap - EXIT
 
-          sleep 10
-          sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
-
-          echo "${SCENARIO}_Start,$START_TIME,$W3C_TRACEPARENT,$START_EPOCH_MS" > "$SCENARIO_DIR/timestamps.csv"
-          echo "${SCENARIO}_End,$END_TIME,$W3C_TRACEPARENT" >> "$SCENARIO_DIR/timestamps.csv"
-
-          node scripts/make_pipeline_spans.js build --input "$RAW_SPANS" --output "$SPANS_JSON" --traceparent "$W3C_TRACEPARENT" --scenario "$SCENARIO"
+          SPAN_COUNT=$(grep -cve '^[[:space:]]*$' "$RAW_SPANS" || echo 0)
+          if [ "$SPAN_COUNT" -ne 10 ]; then echo "Expected 10 spans but found $SPAN_COUNT"; exit 1; fi
 
           ACTUAL_SEC=$(python3 -c "from datetime import datetime; s=datetime.strptime('$START_TIME','%Y-%m-%d %H:%M:%S.%f'); e=datetime.strptime('$END_TIME','%Y-%m-%d %H:%M:%S.%f'); print(round((e-s).total_seconds(),2))")
           USABLE_CAP=$((PROFILER_CAP - 20))
           TRUNCATED=$(python3 -c "print('true' if $ACTUAL_SEC > $USABLE_CAP else 'false')")
-          SPAN_COUNT=$(grep -cve '^[[:space:]]*$' "$RAW_SPANS")
-          cat > "$SCENARIO_DIR/duration_check.json" << EOFJSON
-          {"scenario": "$SCENARIO", "profiler_cap_seconds": $PROFILER_CAP, "usable_cap_seconds": $USABLE_CAP, "actual_duration_seconds": $ACTUAL_SEC, "task_seconds": $ACTUAL_SEC, "truncated": $TRUNCATED, "span_count": $SPAN_COUNT, "failed_span_count": $FAILED_SPAN_COUNT, "calibration_repetitions": 3}
-          EOFJSON
-
-          if [ "$SPAN_COUNT" -ne 10 ]; then echo "Expected 10 spans but found $SPAN_COUNT"; exit 1; fi
           if [ "$TRUNCATED" = "true" ]; then echo "TRUNCATED: Test_Server_Spans ran ${ACTUAL_SEC}s but usable cap was ${USABLE_CAP}s"; exit 1; fi
         shell: bash
 
@@ -680,17 +721,65 @@ jobs:
           SPANS_JSON="$SCENARIO_DIR/spans.json"
           rm -f "$RAW_SPANS" "$SPANS_JSON"
 
-          # Cleanup trap — ensure profiler and container are stopped on any failure
-          cleanup_span_run() {
-            status=$?
+          FINALIZED=0
+
+          finalize_span_run() {
+            local status="${1:-0}"
+            if [ "$FINALIZED" -eq 1 ]; then return; fi
+            FINALIZED=1
+
+            END_TIME="${END_TIME:-$(python3 -c \
+              "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")}"
+
+            # Stop the container and profiler before generating output
             if [ -n "${CONTAINER_ID:-}" ]; then
               docker stop "$CONTAINER_ID" >/dev/null 2>&1 || true
               docker rm "$CONTAINER_ID" >/dev/null 2>&1 || true
             fi
+            sleep 10
             if [ -n "${PROF_PID:-}" ]; then
               sudo kill "$PROF_PID" 2>/dev/null || true
               wait "$PROF_PID" 2>/dev/null || true
             fi
+
+            # Always write timestamps, even if a test group failed
+            {
+              echo "${SCENARIO}_Start,${START_TIME:-$END_TIME},${W3C_TRACEPARENT:-},${START_EPOCH_MS:-}"
+              echo "${SCENARIO}_End,$END_TIME,${W3C_TRACEPARENT:-}"
+            } > "$SCENARIO_DIR/timestamps.csv"
+
+            # Build spans if records exist; do not hide the original failure
+            if [ -s "$RAW_SPANS" ]; then
+              node scripts/make_pipeline_spans.js build \
+                --input "$RAW_SPANS" --output "$SPANS_JSON" \
+                --traceparent "${W3C_TRACEPARENT:-}" --scenario "$SCENARIO" || true
+            fi
+
+            # Preserve a valid JSON file when span conversion itself fails
+            if [ ! -s "$SPANS_JSON" ]; then
+              printf '{"scenario":"%s","spans":[],"incomplete":true}\n' "$SCENARIO" > "$SPANS_JSON"
+            fi
+
+            # Write duration check
+            local actual_sec usable_cap truncated_flag span_count
+            actual_sec=$(python3 -c "from datetime import datetime; s=datetime.strptime('${START_TIME:-$END_TIME}','%Y-%m-%d %H:%M:%S.%f'); e=datetime.strptime('$END_TIME','%Y-%m-%d %H:%M:%S.%f'); print(round((e-s).total_seconds(),2))")
+            usable_cap=$((PROFILER_CAP - 20))
+            truncated_flag=$(python3 -c "print('true' if $actual_sec > $usable_cap else 'false')")
+            span_count=0
+            if [ -s "$RAW_SPANS" ]; then
+              span_count=$(grep -cve '^[[:space:]]*$' "$RAW_SPANS" || echo 0)
+            fi
+            cat > "$SCENARIO_DIR/duration_check.json" << EOFJSON
+            {"scenario": "$SCENARIO", "profiler_cap_seconds": $PROFILER_CAP, "usable_cap_seconds": $usable_cap, "actual_duration_seconds": $actual_sec, "task_seconds": $actual_sec, "truncated": $truncated_flag, "span_count": $span_count, "failed_span_count": $FAILED_SPAN_COUNT, "calibration_repetitions": 3}
+          EOFJSON
+
+            return "$status"
+          }
+
+          cleanup_span_run() {
+            local status=$?
+            trap - EXIT
+            finalize_span_run "$status" || true
             exit "$status"
           }
           trap cleanup_span_run EXIT
@@ -755,10 +844,13 @@ jobs:
               FAILED_SPAN_COUNT=$((FAILED_SPAN_COUNT + 1))
               echo "WARNING: Span $name exited $exit_code"
             fi
-            node scripts/make_pipeline_spans.js record \
-              --output "$RAW_SPANS" --name "$name" --start-ms "$start_ms" --end-ms "$end_ms" \
-              --exit-code "$exit_code" --test-path "$test_path" --command "pnpm exec vitest run $vitest_args" \
-              --calibration "$calibration" --operation "vitest-directory"
+            # Recording failure is infrastructure failure — do not let it kill remaining spans
+            if ! node scripts/make_pipeline_spans.js record \
+                --output "$RAW_SPANS" --name "$name" --start-ms "$start_ms" --end-ms "$end_ms" \
+                --exit-code "$exit_code" --test-path "$test_path" --command "pnpm exec vitest run $vitest_args" \
+                --calibration "$calibration" --operation "vitest-directory"; then
+              echo "ERROR: Failed to record span $name"
+            fi
           }
 
           # Calibration runs
@@ -773,26 +865,16 @@ jobs:
 
           END_TIME=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])")
 
-          docker stop "$CONTAINER_ID" >/dev/null 2>&1 || true
-          docker rm "$CONTAINER_ID" >/dev/null 2>&1 || true
+          # Normal-path finalization — uses the same function as the trap
+          finalize_span_run 0
+          trap - EXIT
 
-          sleep 10
-          sudo kill $PROF_PID 2>/dev/null || true; wait $PROF_PID 2>/dev/null || true
-
-          echo "${SCENARIO}_Start,$START_TIME,$W3C_TRACEPARENT,$START_EPOCH_MS" > "$SCENARIO_DIR/timestamps.csv"
-          echo "${SCENARIO}_End,$END_TIME,$W3C_TRACEPARENT" >> "$SCENARIO_DIR/timestamps.csv"
-
-          node scripts/make_pipeline_spans.js build --input "$RAW_SPANS" --output "$SPANS_JSON" --traceparent "$W3C_TRACEPARENT" --scenario "$SCENARIO"
+          SPAN_COUNT=$(grep -cve '^[[:space:]]*$' "$RAW_SPANS" || echo 0)
+          if [ "$SPAN_COUNT" -ne 10 ]; then echo "Expected 10 spans but found $SPAN_COUNT"; exit 1; fi
 
           ACTUAL_SEC=$(python3 -c "from datetime import datetime; s=datetime.strptime('$START_TIME','%Y-%m-%d %H:%M:%S.%f'); e=datetime.strptime('$END_TIME','%Y-%m-%d %H:%M:%S.%f'); print(round((e-s).total_seconds(),2))")
           USABLE_CAP=$((PROFILER_CAP - 20))
           TRUNCATED=$(python3 -c "print('true' if $ACTUAL_SEC > $USABLE_CAP else 'false')")
-          SPAN_COUNT=$(grep -cve '^[[:space:]]*$' "$RAW_SPANS")
-          cat > "$SCENARIO_DIR/duration_check.json" << EOFJSON
-          {"scenario": "$SCENARIO", "profiler_cap_seconds": $PROFILER_CAP, "usable_cap_seconds": $USABLE_CAP, "actual_duration_seconds": $ACTUAL_SEC, "task_seconds": $ACTUAL_SEC, "truncated": $TRUNCATED, "span_count": $SPAN_COUNT, "failed_span_count": $FAILED_SPAN_COUNT, "calibration_repetitions": 3}
-          EOFJSON
-
-          if [ "$SPAN_COUNT" -ne 10 ]; then echo "Expected 10 spans but found $SPAN_COUNT"; exit 1; fi
           if [ "$TRUNCATED" = "true" ]; then echo "TRUNCATED: Test_Web_Spans ran ${ACTUAL_SEC}s but usable cap was ${USABLE_CAP}s"; exit 1; fi
         shell: bash
 
