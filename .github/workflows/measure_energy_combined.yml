@@ -535,6 +535,21 @@ jobs:
           SPANS_JSON="$SCENARIO_DIR/spans.json"
           rm -f "$RAW_SPANS" "$SPANS_JSON"
 
+          # Cleanup trap — ensure profiler and container are stopped on any failure
+          cleanup_span_run() {
+            status=$?
+            if [ -n "${CONTAINER_ID:-}" ]; then
+              docker stop "$CONTAINER_ID" >/dev/null 2>&1 || true
+              docker rm "$CONTAINER_ID" >/dev/null 2>&1 || true
+            fi
+            if [ -n "${PROF_PID:-}" ]; then
+              sudo kill "$PROF_PID" 2>/dev/null || true
+              wait "$PROF_PID" 2>/dev/null || true
+            fi
+            exit "$status"
+          }
+          trap cleanup_span_run EXIT
+
           W3C_TRACEPARENT="00-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' | cut -c1-16)-01"
           PROFILER_CAP=2400
           sudo powermetrics --samplers cpu_power -i 100 -n $((PROFILER_CAP * 10)) > "$SCENARIO_DIR/power_data.txt" 2>/dev/null &
@@ -553,8 +568,34 @@ jobs:
           sleep 10
 
           # Pre-install dependencies and build SDK + plugins inside the container
+          # Uses retry logic and extended timeouts to survive transient npm registry failures
           echo "Pre-installing dependencies and building SDK + plugins..."
-          docker exec "$CONTAINER_ID" sh -c "pnpm --filter @immich/sdk --filter @immich/plugin-sdk --filter @immich/plugin-core install --frozen-lockfile && pnpm --filter @immich/sdk build && pnpm --filter @immich/plugin-sdk run build && pnpm --filter @immich/plugin-core run build:tsc && pnpm --filter immich install --frozen-lockfile"
+          docker exec "$CONTAINER_ID" sh -eu -c '
+            pnpm config set fetch-retries 6
+            pnpm config set fetch-retry-factor 2
+            pnpm config set fetch-retry-mintimeout 10000
+            pnpm config set fetch-retry-maxtimeout 120000
+            pnpm config set fetch-timeout 300000
+
+            retry() {
+              attempt=1
+              max_attempts=4
+              while [ "$attempt" -le "$max_attempts" ]; do
+                if "$@"; then return 0; fi
+                if [ "$attempt" -eq "$max_attempts" ]; then return 1; fi
+                sleep_seconds=$((attempt * 20))
+                echo "Command failed; retrying in ${sleep_seconds}s (attempt $((attempt + 1))/$max_attempts)"
+                sleep "$sleep_seconds"
+                attempt=$((attempt + 1))
+              done
+            }
+
+            retry pnpm --filter @immich/sdk --filter @immich/plugin-sdk --filter @immich/plugin-core install --frozen-lockfile
+            pnpm --filter @immich/sdk build
+            pnpm --filter @immich/plugin-sdk run build
+            pnpm --filter @immich/plugin-core run build:tsc
+            retry pnpm --filter immich install --frozen-lockfile
+          '
 
           run_server_span() {
             local name="$1" calibration="$2" test_path="$3"
@@ -639,6 +680,21 @@ jobs:
           SPANS_JSON="$SCENARIO_DIR/spans.json"
           rm -f "$RAW_SPANS" "$SPANS_JSON"
 
+          # Cleanup trap — ensure profiler and container are stopped on any failure
+          cleanup_span_run() {
+            status=$?
+            if [ -n "${CONTAINER_ID:-}" ]; then
+              docker stop "$CONTAINER_ID" >/dev/null 2>&1 || true
+              docker rm "$CONTAINER_ID" >/dev/null 2>&1 || true
+            fi
+            if [ -n "${PROF_PID:-}" ]; then
+              sudo kill "$PROF_PID" 2>/dev/null || true
+              wait "$PROF_PID" 2>/dev/null || true
+            fi
+            exit "$status"
+          }
+          trap cleanup_span_run EXIT
+
           W3C_TRACEPARENT="00-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')-$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' | cut -c1-16)-01"
           PROFILER_CAP=1200
           sudo powermetrics --samplers cpu_power -i 100 -n $((PROFILER_CAP * 10)) > "$SCENARIO_DIR/power_data.txt" 2>/dev/null &
@@ -657,8 +713,32 @@ jobs:
           sleep 10
 
           # Pre-install SDK + web dependencies inside the container
+          # Uses retry logic and extended timeouts to survive transient npm registry failures
           echo "Pre-installing SDK and web dependencies..."
-          docker exec "$CONTAINER_ID" sh -c "pnpm --filter @immich/sdk install --frozen-lockfile && pnpm --filter @immich/sdk build && pnpm --filter immich-web install --frozen-lockfile"
+          docker exec "$CONTAINER_ID" sh -eu -c '
+            pnpm config set fetch-retries 6
+            pnpm config set fetch-retry-factor 2
+            pnpm config set fetch-retry-mintimeout 10000
+            pnpm config set fetch-retry-maxtimeout 120000
+            pnpm config set fetch-timeout 300000
+
+            retry() {
+              attempt=1
+              max_attempts=4
+              while [ "$attempt" -le "$max_attempts" ]; do
+                if "$@"; then return 0; fi
+                if [ "$attempt" -eq "$max_attempts" ]; then return 1; fi
+                sleep_seconds=$((attempt * 20))
+                echo "Command failed; retrying in ${sleep_seconds}s (attempt $((attempt + 1))/$max_attempts)"
+                sleep "$sleep_seconds"
+                attempt=$((attempt + 1))
+              done
+            }
+
+            retry pnpm --filter @immich/sdk install --frozen-lockfile
+            pnpm --filter @immich/sdk build
+            retry pnpm --filter immich-web install --frozen-lockfile
+          '
 
           run_web_span() {
             local name="$1" calibration="$2" test_path="$3"
