@@ -191,7 +191,7 @@ jobs:
             $endMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
             if ($exitCode -ne 0 -and -not $Calibration) { $script:failedSpanCount += 1; Write-Warning "Span $Name exited $exitCode" }
             $commandText = "pnpm exec vitest run --config test/vitest.config.mjs " + ($VitestArgs -join " ")
-            node scripts\make_pipeline_spans.js record `
+            node scripts\make_pipeline_spans.cjs record `
               --output "$rawSpans" --name "$Name" --start-ms "$startMs" --end-ms "$endMs" `
               --exit-code "$exitCode" --test-path "$TestPath" --command "$commandText" `
               --calibration "$Calibration" --operation "vitest-service-group"
@@ -200,7 +200,7 @@ jobs:
 
           # Calibration runs
           for ($i = 1; $i -le 3; $i++) {
-            Invoke-ServerSpan -Name "vitest.server.Calibration.$i" -TestPath "" -VitestArgs @("--testPathPattern=^NO_MATCH$") -Calibration $true
+            Invoke-ServerSpan -Name "vitest.server.Calibration.$i" -TestPath "" -VitestArgs @("--testNamePattern=^NO_MATCH$") -Calibration $true
           }
 
           # Server test groups — by service functional area
@@ -231,7 +231,7 @@ jobs:
           echo "${scenario}_Start,$startTime,$w3cTraceparent,$startEpochMs" > "$scenarioDir\timestamps.csv"
           echo "${scenario}_End,$endTime,$w3cTraceparent" >> "$scenarioDir\timestamps.csv"
 
-          node scripts\make_pipeline_spans.js build --input "$rawSpans" --output "$spansJson" --traceparent "$w3cTraceparent" --scenario "$scenario"
+          node scripts\make_pipeline_spans.cjs build --input "$rawSpans" --output "$spansJson" --traceparent "$w3cTraceparent" --scenario "$scenario"
           if ($LASTEXITCODE -ne 0) { throw "Failed to build spans.json for $scenario" }
 
           $actualSec = ($scenarioEndClock - $scenarioStartClock).TotalSeconds
@@ -290,7 +290,7 @@ jobs:
             $endMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
             if ($exitCode -ne 0 -and -not $Calibration) { $script:failedSpanCount += 1; Write-Warning "Span $Name exited $exitCode" }
             $commandText = "pnpm exec vitest run " + ($VitestArgs -join " ")
-            node scripts\make_pipeline_spans.js record `
+            node scripts\make_pipeline_spans.cjs record `
               --output "$rawSpans" --name "$Name" --start-ms "$startMs" --end-ms "$endMs" `
               --exit-code "$exitCode" --test-path "$TestPath" --command "$commandText" `
               --calibration "$Calibration" --operation "vitest-directory"
@@ -299,7 +299,7 @@ jobs:
 
           # Calibration runs
           for ($i = 1; $i -le 3; $i++) {
-            Invoke-WebSpan -Name "vitest.web.Calibration.$i" -TestPath "" -VitestArgs @("--testPathPattern=^NO_MATCH$") -Calibration $true
+            Invoke-WebSpan -Name "vitest.web.Calibration.$i" -TestPath "" -VitestArgs @("--testNamePattern=^NO_MATCH$") -Calibration $true
           }
 
           # Web test groups — by src/lib subdirectory
@@ -319,7 +319,7 @@ jobs:
           echo "${scenario}_Start,$startTime,$w3cTraceparent,$startEpochMs" > "$scenarioDir\timestamps.csv"
           echo "${scenario}_End,$endTime,$w3cTraceparent" >> "$scenarioDir\timestamps.csv"
 
-          node scripts\make_pipeline_spans.js build --input "$rawSpans" --output "$spansJson" --traceparent "$w3cTraceparent" --scenario "$scenario"
+          node scripts\make_pipeline_spans.cjs build --input "$rawSpans" --output "$spansJson" --traceparent "$w3cTraceparent" --scenario "$scenario"
           if ($LASTEXITCODE -ne 0) { throw "Failed to build spans.json for $scenario" }
 
           $actualSec = ($scenarioEndClock - $scenarioStartClock).TotalSeconds
@@ -564,7 +564,7 @@ jobs:
 
             # Build spans if records exist; do not hide the original failure
             if [ -s "$RAW_SPANS" ]; then
-              node scripts/make_pipeline_spans.js build \
+              node scripts/make_pipeline_spans.cjs build \
                 --input "$RAW_SPANS" --output "$SPANS_JSON" \
                 --traceparent "${W3C_TRACEPARENT:-}" --scenario "$SCENARIO" || true
             fi
@@ -660,18 +660,15 @@ jobs:
               FAILED_SPAN_COUNT=$((FAILED_SPAN_COUNT + 1))
               echo "WARNING: Span $name exited $exit_code"
             fi
-            # Recording failure is infrastructure failure — do not let it kill remaining spans
-            if ! node scripts/make_pipeline_spans.js record \
-                --output "$RAW_SPANS" --name "$name" --start-ms "$start_ms" --end-ms "$end_ms" \
-                --exit-code "$exit_code" --test-path "$test_path" --command "pnpm exec vitest run --config test/vitest.config.mjs $vitest_args" \
-                --calibration "$calibration" --operation "vitest-service-group"; then
-              echo "ERROR: Failed to record span $name"
-            fi
+            node scripts/make_pipeline_spans.cjs record \
+              --output "$RAW_SPANS" --name "$name" --start-ms "$start_ms" --end-ms "$end_ms" \
+              --exit-code "$exit_code" --test-path "$test_path" --command "pnpm exec vitest run --config test/vitest.config.mjs $vitest_args" \
+              --calibration "$calibration" --operation "vitest-service-group"
           }
 
           # Calibration runs
           for REP in 1 2 3; do
-            run_server_span "vitest.server.Calibration.$REP" "true" "" --testPathPattern="^NO_MATCH$"
+            run_server_span "vitest.server.Calibration.$REP" "true" "" --testNamePattern="^NO_MATCH$"
           done
 
           # Server test groups — by service functional area
@@ -750,7 +747,7 @@ jobs:
 
             # Build spans if records exist; do not hide the original failure
             if [ -s "$RAW_SPANS" ]; then
-              node scripts/make_pipeline_spans.js build \
+              node scripts/make_pipeline_spans.cjs build \
                 --input "$RAW_SPANS" --output "$SPANS_JSON" \
                 --traceparent "${W3C_TRACEPARENT:-}" --scenario "$SCENARIO" || true
             fi
@@ -844,18 +841,15 @@ jobs:
               FAILED_SPAN_COUNT=$((FAILED_SPAN_COUNT + 1))
               echo "WARNING: Span $name exited $exit_code"
             fi
-            # Recording failure is infrastructure failure — do not let it kill remaining spans
-            if ! node scripts/make_pipeline_spans.js record \
-                --output "$RAW_SPANS" --name "$name" --start-ms "$start_ms" --end-ms "$end_ms" \
-                --exit-code "$exit_code" --test-path "$test_path" --command "pnpm exec vitest run $vitest_args" \
-                --calibration "$calibration" --operation "vitest-directory"; then
-              echo "ERROR: Failed to record span $name"
-            fi
+            node scripts/make_pipeline_spans.cjs record \
+              --output "$RAW_SPANS" --name "$name" --start-ms "$start_ms" --end-ms "$end_ms" \
+              --exit-code "$exit_code" --test-path "$test_path" --command "pnpm exec vitest run $vitest_args" \
+              --calibration "$calibration" --operation "vitest-directory"
           }
 
           # Calibration runs
           for REP in 1 2 3; do
-            run_web_span "vitest.web.Calibration.$REP" "true" "" --testPathPattern="^NO_MATCH$"
+            run_web_span "vitest.web.Calibration.$REP" "true" "" --testNamePattern="^NO_MATCH$"
           done
 
           # Web test groups — by src/lib subdirectory

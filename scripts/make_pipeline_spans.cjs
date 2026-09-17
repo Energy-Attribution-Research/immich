@@ -6,8 +6,8 @@ const path = require('path');
 
 function usage() {
   console.error(`Usage:
-  node scripts/make_pipeline_spans.js record --output <raw.ndjson> --name <span> --start-ms <ms> --end-ms <ms> --exit-code <n> [--test-path <path>] [--command <command>] [--calibration true|false] [--operation <name>]
-  node scripts/make_pipeline_spans.js build  --input <raw.ndjson> --output <spans.json> --traceparent <traceparent> --scenario <scenario>`);
+  node scripts/make_pipeline_spans.cjs record --output <raw.ndjson> --name <span> --start-ms <ms> --end-ms <ms> --exit-code <n> [--test-path <path>] [--command <command>] [--calibration true|false] [--operation <name>]
+  node scripts/make_pipeline_spans.cjs build  --input <raw.ndjson> --output <spans.json> --traceparent <traceparent> --scenario <scenario>`);
 }
 
 function parseArgs(argv) {
